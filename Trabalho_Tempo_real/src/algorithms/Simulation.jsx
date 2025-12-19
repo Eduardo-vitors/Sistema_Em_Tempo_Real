@@ -44,7 +44,6 @@ function pickJob(readyJobs, algorithm, tasks) {
         const Ta = tasks.get(a.taskId).periodo;
         const Tb = tasks.get(b.taskId).periodo;
         if (Ta !== Tb) return Ta - Tb;
-        // desempate determinístico
         if (a.release !== b.release) return a.release - b.release;
         return a.taskId - b.taskId;
       })[0];
@@ -58,6 +57,11 @@ function pickJob(readyJobs, algorithm, tasks) {
       if (a.release !== b.release) return a.release - b.release;
       return a.taskId - b.taskId;
     })[0];
+}
+
+// ✅ Opção 1: escalonável se NÃO houver nenhum "miss" no horizonte simulado
+function hasDeadlineMiss(tasksArr) {
+  return tasksArr.some((t) => t.timeline.some((state) => state === "miss"));
 }
 
 /**
@@ -74,7 +78,10 @@ export default function Simulation({ algorithm, processData, horizon = 50 }) {
   const [speed, setSpeed] = useState(1);
   const [simulationState, setSimulationState] = useState("paused");
 
-  // clock visual (mesmo esquema do seu projeto original)
+  // ✅ NOVO: status de escalonabilidade (Opção 1)
+  const [isSchedulable, setIsSchedulable] = useState(true);
+
+  // clock visual
   useEffect(() => {
     const interval = setInterval(() => {
       if (finalTime === majorTime) setSimulationState("paused");
@@ -92,7 +99,7 @@ export default function Simulation({ algorithm, processData, horizon = 50 }) {
     return () => clearInterval(interval);
   }, [finalTime, majorTime, simulationState, speed]);
 
-  // simulação em si
+  // simulação
   useEffect(() => {
     const H = clampInt(horizon, 1, 10_000);
 
@@ -102,7 +109,7 @@ export default function Simulation({ algorithm, processData, horizon = 50 }) {
       const C = clampInt(t.tempo ?? 1, 1, 10_000);
       const offset = clampInt(t.chegada ?? 0, 0, 10_000);
       const Draw = clampInt(t.deadline ?? 0, 0, 10_000);
-      const D = Draw === 0 ? T : Draw;
+      const D = Draw === 0 ? T : Draw; // D=0 => assume D=T
 
       return {
         id: t.id ?? i + 1,
@@ -116,34 +123,23 @@ export default function Simulation({ algorithm, processData, horizon = 50 }) {
 
     const tasks = new Map(tasksArr.map((t) => [t.id, t]));
 
-    // Se o usuário deixou horizon muito pequeno, tudo bem.
-    // Se quiser um padrão melhor, dá pra usar hiperperíodo:
-    // const hp = computeHyperperiod(tasksArr);
-
     // Próxima liberação (release) de cada tarefa
     const nextRelease = new Map();
     tasksArr.forEach((t) => nextRelease.set(t.id, t.chegada));
 
-    /**
-     * Jobs prontos (fila global).
-     * Cada job:
-     *  - taskId
-     *  - remaining
-     *  - release
-     *  - deadlineAbs
-     */
+    // fila global de jobs prontos + job rodando
     let ready = [];
     let running = null;
 
-    // pequeno helper: marca estados em um intervalo [t0, t1)
+    // helper: marca estados em um intervalo [t0, t1)
     function fillInterval(t0, t1, runningJob, readyJobs) {
       for (let t = t0; t < t1 && t < H; t++) {
-        // calcula se existe algum job vencido por tarefa
         const overdueByTask = new Set(
           readyJobs
             .filter((j) => j.deadlineAbs <= t && j.remaining > 0)
             .map((j) => j.taskId)
         );
+
         if (runningJob && runningJob.deadlineAbs <= t && runningJob.remaining > 0) {
           overdueByTask.add(runningJob.taskId);
         }
@@ -159,19 +155,14 @@ export default function Simulation({ algorithm, processData, horizon = 50 }) {
           else if (hasPending) state = "wait";
           else state = "idle";
 
-          // se há atraso de deadline, destaca como 'miss'
-          if (overdueByTask.has(task.id) && !isRunning) state = "miss";
-          if (overdueByTask.has(task.id) && isRunning) state = "miss"; // enfatiza também quando roda atrasado
+          if (overdueByTask.has(task.id)) state = "miss";
 
           task.timeline[t] = state;
         });
       }
     }
 
-    // Simulador de eventos discretos:
-    // - libera todos os jobs no tempo t
-    // - escolhe o job (RM/EDF)
-    // - avança até o próximo evento (novo release ou término)
+    // Simulador evento-a-evento
     let time = 0;
 
     while (time < H) {
@@ -189,20 +180,18 @@ export default function Simulation({ algorithm, processData, horizon = 50 }) {
         }
       });
 
-      // 2) Reavalia quem roda (preemptivo)
+      // 2) Escolha preemptiva
       const chosen = pickJob(ready, algorithm, tasks);
-      if (chosen !== running) {
-        running = chosen;
-      }
+      if (chosen !== running) running = chosen;
 
-      // 3) Descobre próximo evento
-      const nextRel = Math.min(
-        ...Array.from(nextRelease.values()).filter((v) => v > time)
-      );
+      // 3) Próximo evento (release futuro ou término)
+      const futureReleases = Array.from(nextRelease.values()).filter((v) => v > time);
+      const nextRel = futureReleases.length ? Math.min(...futureReleases) : Infinity;
+
       const finish = running ? time + running.remaining : Infinity;
-      const tNext = Math.min(nextRel ?? Infinity, finish, H);
+      const tNext = Math.min(nextRel, finish, H);
 
-      // Se não há nada pronto e o próximo release é no futuro, pula direto
+      // CPU ociosa até o próximo release
       if (!running && ready.length === 0) {
         const jumpTo = Number.isFinite(nextRel) ? Math.min(nextRel, H) : H;
         fillInterval(time, jumpTo, null, ready);
@@ -210,14 +199,13 @@ export default function Simulation({ algorithm, processData, horizon = 50 }) {
         continue;
       }
 
-      // 4) Preenche o Gantt do intervalo e "consome" execução
+      // 4) Preenche Gantt e consome execução
       fillInterval(time, tNext, running, ready);
 
       if (running) {
         const delta = tNext - time;
         running.remaining -= delta;
         if (running.remaining <= 0) {
-          // remove esse job da fila
           ready = ready.filter((j) => j !== running);
           running = null;
         }
@@ -226,29 +214,17 @@ export default function Simulation({ algorithm, processData, horizon = 50 }) {
       time = tNext;
     }
 
+    // ✅ Opção 1: escalonável se não houver "miss"
+    setIsSchedulable(!hasDeadlineMiss(tasksArr));
+
     setSimulationData(tasksArr);
     setFinalTime(H);
+
     moment.current = 0;
     setMajorTime(0);
     setMinorTime(0);
     setSimulationState("paused");
   }, [algorithm, processData, horizon]);
-
-  function getAVGUtilization(time) {
-    // Mede % de tarefas executando (exe/miss) por instante, média simples.
-    // Não é a métrica "clássica" de STR, mas dá um indicador rápido.
-    let exec = 0;
-    let total = 0;
-
-    simulationData.forEach((t) => {
-      for (let i = 0; i < time && i < t.timeline.length; i++) {
-        total++;
-        if (["exe", "miss"].includes(t.timeline[i])) exec++;
-      }
-    });
-
-    return total === 0 ? 0 : (exec / total) * 100;
-  }
 
   function getStatus(task, time) {
     const index = minorTime === 0 ? time - 1 : time;
@@ -274,7 +250,25 @@ export default function Simulation({ algorithm, processData, horizon = 50 }) {
   return (
     <>
       <div className="simulation-header">
-        <h3>Simulação {algoLabel} (tempo 0 → {finalTime})</h3>
+        <div>
+          <h3>Simulação {algoLabel} (tempo 0 → {finalTime})</h3>
+
+          {/* ✅ Opção 1: badge Escalonável / Não escalonável */}
+          <div
+            style={{
+              marginTop: "0.6rem",
+              padding: "0.35rem 0.75rem",
+              borderRadius: "10px",
+              fontWeight: 700,
+              width: "fit-content",
+              backgroundColor: isSchedulable ? "#d4edda" : "#f8d7da",
+              color: isSchedulable ? "#155724" : "#721c24",
+              border: `1px solid ${isSchedulable ? "#c3e6cb" : "#f5c6cb"}`,
+            }}
+          >
+            {isSchedulable ? "✔ Conjunto Escalonável" : "✖ Conjunto NÃO Escalonável"}
+          </div>
+        </div>
       </div>
 
       <div className="simulation-controls">
@@ -379,10 +373,6 @@ export default function Simulation({ algorithm, processData, horizon = 50 }) {
             </div>
           </div>
         ))}
-      </div>
-
-      <div className="turnaround-info">
-        <h4>Indicador (média de execução): {getAVGUtilization(majorTime).toFixed(1)}%</h4>
       </div>
     </>
   );

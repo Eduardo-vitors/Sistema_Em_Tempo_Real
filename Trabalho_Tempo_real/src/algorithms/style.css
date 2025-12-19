@@ -198,3 +198,11 @@
   color: #bdbdbd;
   border-color: #e0e0e0;
 }
+
+  /* Deadline Miss */
+.timeline-block.miss {
+  background-color: #e74c3c;   /* vermelho forte */
+  color: white;
+  border-color: #c0392b;
+  font-weight: bold;
+}
